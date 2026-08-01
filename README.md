@@ -24,10 +24,12 @@ Job description -> parsed facets -> job embedding (precomputed, indexed)
                                 |
                     [2] rerank each pair in detail   expensive, runs on 20
                                 |
+                    [3] allocate across candidates   avoids concentration
+                                |
                             ranked jobs
 ```
 
-The two stages optimise different things. Retrieval maximises recall at low cost: it must not lose a good role, but it is allowed to pass along mediocre ones. Reranking maximises precision at the top: it examines each shortlisted pair closely and decides the final order.
+Stages 1 and 2 optimise different things. Retrieval maximises recall at low cost: it must not lose a good role, but it is allowed to pass along mediocre ones. Reranking maximises precision at the top: it examines each shortlisted pair closely and decides the final order. Stage 3 is discussed under [Allocation](#allocation).
 
 Candidate features are extracted once, without reference to any target job, so a CV is processed a single time and compared against every opening. Job embeddings are precomputed and refreshed only when a description changes.
 
@@ -59,15 +61,21 @@ Job facets mirror them, with the crucial addition of a mandatory/preferred disti
 | Languages | English (mandatory) |
 | Location | Milan, hybrid; no visa sponsorship |
 
-Each facet is rendered as canonical text. Facets can be embedded jointly into one vector, or separately into per-facet vectors that are compared field by field. Comparing field by field is more faithful to how fit actually works, at the cost of more vectors to store and search.
+Each facet is rendered as canonical text and given its **own token budget**, so a long employment history cannot crowd out the education or language facets. Facets are delimited by dedicated tokens rather than concatenated into a single blob that gets truncated arbitrarily.
+
+Facets can be embedded jointly into one vector, or separately into per-facet vectors compared field by field. Field-by-field is more faithful to how fit actually works, at the cost of more vectors to store and search.
+
+Parsing is the dominant cost in the pipeline, so two things are worth testing before defaulting to an LLM for everything: caching parsed output keyed by document hash, and using a dedicated skill-extraction encoder instead of a general LLM. The evidence suggests lightweight bi-encoders match LLM extraction quality here at a fraction of the cost and latency.
 
 ## Stage 1 — Retrieval
 
 A frozen multilingual sentence encoder produces the initial embeddings — no training required to get a working baseline. Vectors are L2-normalised so inner product equals cosine similarity.
 
-The job index starts as an exact flat index, which is entirely adequate for tens of thousands of jobs and gives an exact-recall reference point. At larger scale it becomes an approximate index (HNSW or IVF-PQ), and the recall lost to approximation is measured against the flat index rather than assumed negligible.
+The job index starts as an exact flat index, which is adequate for tens of thousands of jobs and gives an exact-recall reference point. At larger scale it becomes an approximate index (HNSW or IVF-PQ), and the recall lost to approximation is measured against the flat index rather than assumed negligible.
 
-Retrieval returns the top `k` jobs, with `k ≈ 20` as a starting point. `k` is a tunable recall/cost trade-off, and is set by measuring `Recall@k`: the fraction of genuinely good roles that survive into the shortlist. A good role discarded here can never be recovered downstream, which is why this stage is tuned for recall and not precision.
+Retrieval returns the top `k` jobs, `k ≈ 20` as a starting point. `k` is a tunable recall/cost trade-off, set by measuring `Recall@k`: the fraction of genuinely good roles that survive into the shortlist. A good role discarded here can never be recovered downstream, which is why this stage is tuned for recall and not precision.
+
+**A register gap sits between the two sides.** A CV says what someone did; a job description says what someone should do. They describe the same underlying competence in different grammar, which costs retrieval recall. One cheap remedy is to generate a *hypothetical CV* from each job description with an LLM and embed that instead of, or alongside, the raw description — moving both sides into the same register before comparison.
 
 ## Stage 2 — Reranking
 
@@ -100,13 +108,15 @@ score = w1 * semantic_similarity
 | `experience_compatibility` | years held against the stated threshold |
 | `missing_mandatory_requirements` | hard penalty per unmet mandatory requirement |
 
-Two properties matter here. Seniority is **asymmetric**: underqualified and overqualified are both mismatches, but not the same mismatch, and they take different penalty curves. Mandatory requirements are **near-disqualifying** rather than merely costly — no amount of semantic similarity should rescue a candidate who cannot legally take the job.
+Two properties matter. Seniority is **asymmetric**: underqualified and overqualified are both mismatches, but not the same one, and they take different penalty curves. Mandatory requirements are **near-disqualifying** rather than merely costly — no amount of semantic similarity should rescue a candidate who cannot legally take the job.
+
+Hard constraints are enforced by rule rather than learned. Production systems in this domain consistently keep an explicit rule layer alongside the model; visa eligibility is not something to hope a gradient discovers.
 
 Weights start hand-set as a transparent baseline, then are learned.
 
-**Model choice.** Two options are viable. A cross-encoder reads the candidate and job text jointly and is the stronger model, but it is expensive and opaque. Gradient-boosted ranking (LambdaMART) over the retrieval score plus structured features is cheaper, natively handles heterogeneous tabular features, directly optimises a ranking objective with graded labels, and yields per-feature attributions.
+**Model choice.** A cross-encoder reads candidate and job jointly and is the stronger model, but it is expensive and opaque. Gradient-boosted ranking (LambdaMART) over the retrieval score plus structured features is cheaper, natively handles heterogeneous tabular features, directly optimises a ranking objective with graded labels, and yields per-feature attributions.
 
-The plan starts with LambdaMART, because explainability is not a nice-to-have here: a recommendation a recruiter cannot understand is a recommendation they will not act on. The cross-encoder is a later experiment, not the critical path.
+The plan starts with LambdaMART. Explainability is not a nice-to-have here: a recommendation a recruiter cannot understand is one they will not act on, and — see [Compliance](#compliance) — an individual decision may have to be explained on request. The cross-encoder is a later experiment, not the critical path.
 
 ## Asymmetry
 
@@ -114,7 +124,7 @@ Candidates and jobs are encoded by separate towers rather than a shared encoder.
 
 ## Labels
 
-Funnel depth gives **graded relevance**, and there is a large volume of it. How far a candidate progressed — screening, interview, final stages, offer — is an ordinal signal, not a binary one:
+Funnel depth gives **graded relevance**, and there is a large volume of it. How far a candidate progressed is ordinal, not binary:
 
 | Depth reached | Relevance grade |
 |---|---|
@@ -124,15 +134,27 @@ Funnel depth gives **graded relevance**, and there is a large volume of it. How 
 | Reached final stages | 3 |
 | Offer | 4 |
 
-This maps directly onto graded ranking metrics and onto LambdaMART, both of which are built for exactly this shape of label. It is a considerably richer training signal than a binary hired/not-hired flag.
+This maps directly onto graded ranking metrics and onto LambdaMART, both built for exactly this shape of label — a considerably richer signal than a binary hired/not-hired flag.
 
-Two structural properties shape the design:
+Three structural properties shape the design.
 
-**Unobserved pairs are not negatives.** Outcomes exist only where a candidate actually applied. Every other candidate–job pair is unknown — and since surfacing exactly those pairs is the point of the system, they cannot be sampled as negatives. Negatives are constructed deliberately: observed low-depth pairs, plus hard negatives mined from roles that are semantically close but structurally incompatible.
+**Unobserved pairs are not negatives.** Outcomes exist only where a candidate actually applied. Every other pair is unknown — and since surfacing exactly those pairs is the point of the system, they cannot be sampled as negatives.
 
-**Depth partly encodes the current policy.** Progression reflects the decisions of existing screeners and recruiters, so a model fit naively to it learns to reproduce current behaviour, blind spots included. This is manageable — it is what the held-out evaluation and the cross-role slices are for — but it bounds what the training signal can prove on its own.
+Negatives are therefore constructed deliberately. Observed low-depth pairs are genuine negatives. Beyond those, hard negatives are mined from a *percentile band* of the ranking: search the top few percent by similarity but **exclude the very top**, on the reasoning that the highest-scoring unlabelled pairs are disproportionately false negatives — good matches nobody happened to observe. Mining the band just below yields hard negatives without poisoning the training set with the exact cases the system exists to find.
 
-Competing outcomes are separated from poor fit: withdrawal, position closure, and visa or location constraints are labelled distinctly rather than folded into the negative class.
+**Depth partly encodes the current policy.** Progression reflects decisions made by existing screeners and recruiters, so a model fit naively to it learns to reproduce current behaviour, blind spots included. This is not hypothetical: a published system trained on real-world matching rules reached `NDCG@20 = 0.706` while agreeing with independent human judgement only 46% of the time. It had learned the rules, not the documents.
+
+The mitigation is a **second evaluation set, hand-judged and independent of funnel outcomes**. Alignment with it is tracked as a separate metric alongside NDCG. A model that improves on funnel depth while drifting away from independent judgement is memorising the old policy, and the two numbers make that visible.
+
+**Depth conflates qualification with preference.** A candidate who was qualified but withdrew looks identical to one who was rejected as unqualified. Withdrawal, position closure, and visa or location constraints are labelled distinctly rather than folded into the negative class.
+
+## Allocation
+
+Ranking each candidate independently produces a predictable failure: every recruiter is pointed at the same small set of strong candidates, who saturate, and the realised match rate falls well below what offline metrics predicted. This is a congestion effect in a two-sided market, and it does not show up in per-candidate ranking metrics at all.
+
+The fix is to treat the final step as an **assignment problem** rather than a set of independent rankings — maximising total expected fit subject to role capacity, candidate attention limits, and hard eligibility constraints, in the spirit of stable matching.
+
+This stage is deliberately separated from scoring. Stage 2 answers *how good is this pair*; stage 3 answers *given everyone's scores, who should actually be surfaced to whom*. Conflating them is what produces concentration.
 
 ## Evaluation
 
@@ -141,13 +163,16 @@ Competing outcomes are separated from poor fit: withdrawal, position closure, an
 | `Recall@20` | retrieval | did the shortlist keep the good roles? |
 | `NDCG@10` | reranking | are the best roles ranked at the top? |
 | `MRR` | reranking | how far down is the first good role? |
+| Independent-judgement alignment | reranking | is it reading the documents, or replaying the old policy? |
 
 Split protocol:
 
 - **Grouped by candidate** — no candidate appears in both train and test, or the model is graded on people it has already seen.
 - **Ordered in time** — train on the past, test on the future, matching how the system would actually be used.
 
-Slices reported separately for seniority band, function, and cold-start candidates with sparse CVs, since aggregate numbers hide exactly the failures that matter.
+**Metrics are sliced by job family as a primary reporting axis, not a supplementary one.** Variation in retrieval quality across job families has been found to exceed the gains from model upgrades, meaning a global improvement can conceal a regression in the function that matters most. Seniority band and cold-start candidates with sparse CVs are also reported separately.
+
+`Recall@20` is additionally sliced by demographic proxy. A fair reranker cannot repair an unfair shortlist — if a group is disproportionately excluded at retrieval, no downstream stage sees them. Audits of embedding-based CV retrieval have found substantial disparities by name alone, along with sensitivity to incidental factors such as document length, so names and PII are stripped before embedding and length is normalised.
 
 The decisive test is not aggregate ranking quality but whether the system surfaces something a recruiter missed: take candidates rejected for role A, ask whether the model would have flagged them for role B, and check whether comparable profiles were later hired into role B.
 
@@ -171,16 +196,45 @@ The deliverable is not a score. It is a short, explainable list:
 
 Each recommendation carries its reasons: which requirements are met, which are missing, where the seniority sits. If the reason cannot be stated in one sentence, the recommendation is not usable.
 
+## Compliance
+
+Systems that filter job applications or evaluate candidates are classified as high-risk under the EU AI Act (Annex III, 4(a)). Three obligations have direct engineering consequences and are cheaper to build in than to retrofit:
+
+- **Data governance (Art. 10)** — training data must be examined for bias. Here that means the funnel labels, which is the same scrutiny the independent-judgement set is designed to provide.
+- **Logging (Art. 12, 19)** — retrieval candidates, rerank features and scores are logged per decision.
+- **Explanation of individual decisions (Art. 86)** — a specific decision may have to be explained on request. This is a second, independent argument for interpretable structured features in the reranker.
+
+Human review is a weaker safeguard than it appears: biased recommendations have been shown to shift human decisions rather than being caught by them. Post-hoc fairness re-ranking of the final list is a cheap, deployable mitigation that requires no retraining, and has been shown at scale to improve representation without measurable cost to outcome quality.
+
+## Prior art
+
+Selected work that informed the design.
+
+| Work | Relevance |
+|---|---|
+| **ConFit v2** ([code](https://github.com/jasonyux/ConFit-v2)) | Closest published analogue: facet-parsed CV/JD, contrastive bi-encoder, retrieve then rerank. Source of the percentile-band hard-negative strategy and per-facet token budgeting. Includes BM25, XGBoost and embedding baselines. |
+| **LinkedIn, Learning to Retrieve for Job Matching** ([2402.13435](https://arxiv.org/abs/2402.13435)) | Production two-stage retrieval trained on confirmed-hire signal. Chose an interpretable learned retriever over embeddings for the quality objective, and keeps an explicit rule layer. |
+| **JobBERT-v2 / v3** ([HF](https://huggingface.co/TechWolf/JobBERT-v2)) | Asymmetric bi-encoder with separate projection heads per side, trained on 5.5M title↔skill pairs. Independent validation of the two-tower choice. |
+| **ESCO skill extractors** ([HF](https://huggingface.co/jjzha)) | Taxonomy-grounded multilingual skill extraction for the parsing layer. |
+| **PJB benchmark** ([2603.17386](https://arxiv.org/abs/2603.17386)) | Cross-domain performance variance exceeds model-upgrade gains; query rewriting degrades results when combined with reranking. |
+| **RankPO** ([2503.10723](https://arxiv.org/abs/2503.10723)) | Demonstrates rule-mimicry: high NDCG, low agreement with independent judgement. Motivates the second evaluation set. |
+| **Reciprocal recommendation / concentration** ([2411.19214](https://arxiv.org/abs/2411.19214)) | Congestion in two-sided matching; motivates the allocation stage. |
+| **Wilson & Caliskan** ([2407.20371](https://arxiv.org/abs/2407.20371)) | Audit of embedding-based CV retrieval; bias enters at retrieval, before any reranker. |
+| **Fairness-aware ranking at LinkedIn** ([1905.01989](https://arxiv.org/abs/1905.01989)) | Deployed post-processing mitigation, no retraining required. |
+| **RecSys Challenge 2017 (XING)** ([site](http://www.recsyschallenge.com/2017/)) | Graded interaction scoring: recruiter interest weighted 20× a click, explicit rejection priced negatively. |
+
 ## Roadmap
 
 1. Parse CVs and job descriptions into role-neutral facets; cache by document hash
 2. Frozen-embedding retrieval baseline over a flat index; establish `Recall@k`
 3. Ranking metrics and leakage-safe splits — grouped by candidate, ordered in time
-4. Structured compatibility features and a hand-weighted reranker as a transparent baseline
-5. LambdaMART reranker trained on graded funnel-depth labels
-6. Hard negative mining and ablations over each scoring term
-7. Error analysis by seniority, function and cold-start; per-recommendation explanations
-8. Optional: cross-encoder reranking, learned facet encoders
+4. Build the independent hand-judged evaluation set
+5. Structured compatibility features and a hand-weighted reranker as a transparent baseline
+6. LambdaMART reranker trained on graded funnel-depth labels
+7. Percentile-band hard negative mining and ablations over each scoring term
+8. Allocation stage; measure concentration against per-candidate ranking
+9. Error analysis by job family, seniority and cold-start; per-recommendation explanations
+10. Optional: hypothetical-CV generation for the register gap, cross-encoder reranking, learned facet encoders
 
 ## Scope
 
