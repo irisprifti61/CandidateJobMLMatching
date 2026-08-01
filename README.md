@@ -75,7 +75,11 @@ The job index starts as an exact flat index, which is adequate for tens of thous
 
 Retrieval returns the top `k` jobs, `k ≈ 20` as a starting point. `k` is a tunable recall/cost trade-off, set by measuring `Recall@k`: the fraction of genuinely good roles that survive into the shortlist. A good role discarded here can never be recovered downstream, which is why this stage is tuned for recall and not precision.
 
-**A register gap sits between the two sides.** A CV says what someone did; a job description says what someone should do. They describe the same underlying competence in different grammar, which costs retrieval recall. One cheap remedy is to generate a *hypothetical CV* from each job description with an LLM and embed that instead of, or alongside, the raw description — moving both sides into the same register before comparison.
+**A register gap sits between the two sides.** A CV says what someone did; a job description says what someone should do. They describe the same underlying competence in different grammar, which costs retrieval recall.
+
+The tempting fix — generate a hypothetical CV from each job description and embed that — is the wrong one here. Many genuinely different CVs satisfy the same role: a CS graduate with four years in Go, a self-taught engineer with six years of Python, a data engineer pivoting across. That is a multimodal distribution, and generating one hypothetical CV picks a single mode of it, biasing retrieval toward candidates who resemble that archetype and missing the rest. Worse, a generator asked to write the CV for a role writes the *obvious* one — which is precisely the opposite of what this system is for. It also contradicts the asymmetry argument below: requirements map to capabilities one-to-many, not as an invertible function.
+
+The gap is closed at the facet layer instead. Both sides are normalised to the same canonical vocabulary — skills to a shared taxonomy, seniority to a band, experience to a number — so what is compared is normalised fields rather than prose. Whatever residual mismatch remains is learned by the asymmetric encoder from genuinely matched pairs, which reflects the real spread of profiles that succeed in a role rather than a generator's guess at it.
 
 ## Stage 2 — Reranking
 
@@ -234,7 +238,7 @@ Selected work that informed the design.
 7. Percentile-band hard negative mining and ablations over each scoring term
 8. Allocation stage; measure concentration against per-candidate ranking
 9. Error analysis by job family, seniority and cold-start; per-recommendation explanations
-10. Optional: hypothetical-CV generation for the register gap, cross-encoder reranking, learned facet encoders
+10. Optional: cross-encoder reranking, learned facet encoders trained on matched pairs
 
 ## Scope
 
