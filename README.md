@@ -2,6 +2,8 @@
 
 Scoring how well a candidate fits a role — including roles they never applied to.
 
+A learning system rather than a static predictor: recommendations that are acted on generate outcomes for pairs that would otherwise never have been observed, and those outcomes feed periodic retraining. Success is measured as improvement across successive simulated hiring rounds, against a control that does not learn this way.
+
 ## Problem
 
 A candidate applies to one role. If they are rejected, that is usually the end of the story, even when they would have been a strong fit for a different opening.
@@ -78,6 +80,12 @@ There is an established framework for this. **Unbiased learning to rank** treats
 
 Applied to matching specifically: [CFRR](https://arxiv.org/abs/2508.01867) (KDD 2025) uses inverse propensity scoring for two-sided matching including talent platforms, reporting **+51% long-tail coverage** and **−24% Gini exposure inequality**. Long-tail coverage is a direct measure of the "candidate nobody looks at" problem.
 
+**Volume does not dissolve this.** Sparsity here is `applications / (candidates × roles)`, which reduces to *applications per candidate divided by number of roles*. At ~1.4 applications per candidate across 50 roles that is 2.8% of the grid observed — and the figure is invariant to dataset size, since additional candidates add rows and grid cells at the same rate. One quarter and three years of history give the same 2.8%.
+
+Scale therefore fixes the statistical problem (tens of thousands of examples per role is ample) and leaves the structural one untouched. Each candidate is still observed in one or two of fifty roles, and the physics-graduate-in-finance cell is still empty at three million rows. The data is not too small; it is incomplete in a specific direction — dense where people chose to apply, empty everywhere else.
+
+Confirming the true applications-per-candidate ratio is the first query to run. If candidates in fact apply to five roles rather than 1.4, sparsity is 10% and the problem is materially easier.
+
 Candidates who applied to more than one role are especially valuable: they give directly observed cross-role outcomes for the same person, and form a natural validation set for the counterfactual claim. Establishing how many exist is an early task.
 
 ## Evaluation
@@ -92,13 +100,79 @@ Splits are **grouped by candidate** (no one appears in both train and test) and 
 
 The decisive test is not aggregate ranking quality but whether the system surfaces something a recruiter missed: take candidates rejected for role A, ask whether the model would have flagged them for role B, and check whether comparable profiles were later hired into role B.
 
-## Assignment layer
+## Allocation layer
 
-Ranking produces a list per candidate. Allocation is a separate question: roles have capacity, candidates are finite, and locally optimal choices need not be globally optimal.
+Ranking produces a list per candidate. Allocation is a different question, and answering the first does not answer the second: roles have headcount, candidates can realistically enter only one or two processes, interviewers have finite hours, and locally optimal choices need not be globally optimal.
 
-At ~50 roles this is small enough to solve to **proven optimality** rather than heuristically — an advantage of the scale, not a limitation of it. Fairness has been formalised in this setting as envy-freeness and Nash social welfare; see [Fair Reciprocal Recommendation in Matching Markets](https://arxiv.org/abs/2409.00720) (RecSys 2024) when this phase begins.
+The gap is arithmetic, not rhetorical. Two candidates, two roles:
 
-This layer is a second phase, not a prerequisite for a useful ranking.
+|  | Finance | Ops |
+|---|---|---|
+| A | 0.90 | 0.85 |
+| B | 0.88 | 0.30 |
+
+Giving each their own best role sends A to Finance and leaves B with Ops, totalling 1.20. Allocating jointly sends B to Finance and A to Ops, totalling 1.73. Nobody erred; per-candidate ranking is simply the wrong question. On synthetic data with 200 candidates and 50 roles at two seats each, independent top-choice ranking recovers 59% of the achievable total fit.
+
+A well-constructed greedy pass recovers 97.7%, so the case for optimisation is not the residual 2.3%. It is that constraints — interviewer load, one process per candidate, reserved slots — have no principled greedy formulation and a native linear-programming one. At ~50 roles the problem solves to **proven optimality** in milliseconds, an advantage of the scale rather than a limitation of it.
+
+Fairness has been formalised in this setting as envy-freeness and Nash social welfare; see [Fair Reciprocal Recommendation in Matching Markets](https://arxiv.org/abs/2409.00720) (RecSys 2024).
+
+**This imposes two requirements on the scoring model.** An optimiser consumes the estimates it is given and will allocate poor ones optimally, producing a confidently wrong answer with a guarantee attached — worse than a visibly wrong one. So scores must be **calibrated** (0.7 means the outcome occurs 70% of the time, not merely that it ranks above 0.6) and must carry **uncertainty**, which the allocation layer needs in order to distinguish a confident low score from an absent one. Neither property is free, and neither is the default. Both must be built in at the modelling stage rather than retrofitted.
+
+## Continual learning
+
+A one-time fit is the wrong object. Roles change, sourcing channels change, the applicant pool changes, and screening standards change. A model fit on last year's outcomes and left alone degrades quietly — its ranking stays plausible while its scores stop meaning what they meant.
+
+So the system is specified as a loop rather than an artefact:
+
+```
+score all pairs -> allocate under capacity -> selected pairs run -> outcomes
+      ^                                                               |
+      +------ retrain, recalibrate, monitor drift <-------------------+
+```
+
+Cross-field recommendations that are acted on generate outcomes for pairs that would otherwise never have been observed. Those outcomes are the only genuinely new information in the system, and they enter the training set.
+
+**Three distinct maintenance operations**, routinely conflated:
+
+*Retraining* refits the model on accumulated data. Run on a fixed cadence and additionally on trigger when monitoring fires.
+
+*Recalibration* corrects the mapping from score to probability. This drifts faster than ranking quality does, and it drifts invisibly — a model can preserve a correct ordering while its stated probabilities become badly wrong. Since the allocation layer consumes probabilities rather than ranks, this is the failure that silently corrupts allocation.
+
+*Drift monitoring* detects when refitting is needed, distinguishing three cases because they have different remedies:
+
+| Drift | What moved | Example |
+|---|---|---|
+| Covariate | the input distribution | a new sourcing channel changes who applies |
+| Label | the outcome distribution | screening standards tighten, offer rates fall |
+| Concept | the input–outcome relationship | the role's actual content changes, so different features predict success |
+
+Covariate drift is often survivable and correctable by reweighting. Concept drift is not — it invalidates what the model learned, and only refitting addresses it. Instrumentation: population stability index on feature distributions, expected calibration error on a rolling holdout, and ranking quality tracked over time.
+
+**The loop is dangerous by construction.** Outcomes are observed only for pairs the system selected, so training data increasingly reflects the model's own prior beliefs. Retraining on it yields greater confidence without greater accuracy, and blind spots harden with each round. No amount of retraining detects this from the inside — the model's apparent performance *improves* on exactly the population it has learned to select.
+
+The failure has been characterised precisely in an adjacent setting. [Runaway Feedback Loops in Predictive Policing](https://arxiv.org/abs/1706.09847) (FAT\* 2018) proves why the loop occurs, and distinguishes **discovered** incidents — found because the algorithm directed attention there — from **reported** incidents arriving independently of it. The finding transfers directly: organically-arriving applications are the reported channel and model-selected placements are the discovered one, and the paper's result is that the reported channel *attenuates* runaway feedback but cannot remove it without deliberate intervention. That is the argument for exploration stated as a theorem rather than an intuition, and it also demonstrates the correction can be made black-box, by changing what is fed in rather than rebuilding the model.
+
+Two mitigations are structural rather than optional. **Propensity must be logged at recommendation time**: if the reason a pair was selected is not recorded when it is selected, the selection cannot be corrected for afterwards, and the information is unrecoverable. And some allocation must go to pairs the model is uncertain about rather than confident about — which is the extension below, and the reason a placeholder for it belongs in the loop from the start.
+
+**Evaluation is over rounds, not over a single split.** The synthetic environment is what makes this measurable: the generator holds true fit for all pairs, so it can reveal the outcome of any pair, including those never selected. Real data cannot answer that query, which is why the round-based simulation is only possible here.
+
+Each round scores the full grid, allocates under capacity, reveals outcomes for selected pairs only, appends them, retrains, recalibrates, and then measures counterfactual nDCG against the complete ground truth. Success is a rising curve across rounds. The control condition is a pure-exploitation policy, which is expected to plateau or decline while appearing to improve on its own selections — and recommendation diversity is tracked alongside, since self-confirmation shows up as narrowing before it shows up as error.
+
+## Academic extension: exploration
+
+Statistical correction extrapolates; it cannot create information that was never collected. Learning whether physics graduates succeed in finance ultimately requires that some of them enter finance processes.
+
+The formulation reserves part of the allocation for pairs of high model uncertainty rather than high expected value:
+
+```
+maximise   expected hires + λ · information gained
+subject to capacity constraints
+```
+
+where `λ` prices the value of learning against the cost of a less immediately productive placement. This connects the allocation layer to active learning and to bandit problems, and it turns the optimisation layer into the mechanism that repairs the learning layer's central weakness rather than a component bolted onto it.
+
+Kept as a research extension deliberately: it is the part that requires an organisation to act on recommendations it is uncertain about, which is an organisational question rather than a technical one. In simulation it needs no such permission, and it is where the interesting result lies — a system with a small exploration budget should overtake pure exploitation after enough rounds, despite performing worse in the first few.
 
 ## Output
 
@@ -110,14 +184,26 @@ Each recommendation carries its reasons: requirements met, requirements missing,
 
 ## Roadmap
 
-1. Assemble candidate features and graded funnel-depth labels; quantify multi-application candidates
-2. Similarity baseline — the number to beat
-3. Leakage-safe evaluation: grouped by candidate, ordered in time
-4. Supervised per-role scoring, then a shared multi-task model
-5. Propensity modelling and IPS-weighted training for selection bias
-6. Cross-role backtest on multi-application candidates
-7. Error analysis by seniority, function, profile conventionality; per-recommendation explanations
-8. Optional: constrained assignment with fairness
+**Core**
+
+1. ~~Synthetic environment with known counterfactual ground truth and planted selection bias~~ ✓
+2. ~~Leakage-safe evaluation: grouped by candidate, ordered in time, counterfactual nDCG~~ ✓
+3. Similarity baseline — the number to beat
+4. Supervised per-role scoring, then a shared multi-task model; calibrated, with uncertainty
+5. Propensity modelling and IPS-weighted training; verify the gap closes under planted bias and vanishes in the unbiased control
+6. Constrained allocation solved to optimality
+7. Round-based loop: periodic retraining, recalibration, drift monitoring, propensity logging
+8. Per-recommendation explanations; error analysis by seniority, function, profile conventionality
+
+**On real data** — requires read-only access
+
+9. Candidate features and graded funnel-depth labels; establish the applications-per-candidate ratio and the count of multi-application candidates
+10. Cross-role backtest: candidates rejected for role A whom the model flags for role B, checked against comparable profiles later hired into B
+
+**Academic extension**
+
+11. Exploration budget — allocation under uncertainty, measured across simulated hiring rounds against a pure-exploitation control
+12. Fairness constraints in allocation: envy-freeness, Nash social welfare
 
 ## Reading
 
@@ -128,8 +214,12 @@ Two papers are worth reading before writing code:
 
 Useful later, not now: [CFRR](https://arxiv.org/abs/2508.01867) for debiasing applied to matching, [Fair Reciprocal Recommendation](https://arxiv.org/abs/2409.00720) for the allocation phase, [PJFNN](https://arxiv.org/abs/1810.04040) and [APJFNN](https://arxiv.org/abs/1812.08947) for where the field started.
 
+For the loop specifically: **[Runaway Feedback Loops in Predictive Policing](https://arxiv.org/abs/1706.09847)** (FAT\* 2018) for why a self-selecting training loop diverges and how to correct it without touching the model, and *Hidden Technical Debt in Machine Learning Systems* (Sculley et al., NeurIPS 2015) for why the maintenance surface — not the model — is where these systems fail in practice.
+
 ## Scope
 
 Built as a standalone system: generic candidate, role and outcome tables in, ranked matches out. No proprietary data, code or model artefacts belong in this repository.
+
+A personal research project, developed independently and evaluated entirely in simulation. Should the approach demonstrate a measurable gain over rounds against its controls, it could then be proposed as something to trial on real data — but the burden of evidence sits here first, in an environment where the ground truth is known and the claims are falsifiable.
 
 Employment-related models are consequential. This one is intended to widen the set of candidates a human considers — never to reject anyone automatically.
