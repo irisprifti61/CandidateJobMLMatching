@@ -54,6 +54,8 @@ Roles share structure, so a single multi-task model with role as an input is pre
 
 Semantic similarity over job descriptions is retained only as a **baseline to beat**. A learned model must justify itself against it.
 
+This gives a **two-layer system**. A learning layer estimates fit and the uncertainty of that estimate; an optimisation layer decides how to spend limited evaluation capacity across candidates, dividing it between high-confidence recommendations and pairs worth learning about. Both layers are load-bearing, and the second is not a presentation step on top of the first — it is what determines which outcomes ever get observed, and therefore what the first layer can learn next.
+
 ## Labels
 
 Funnel depth as graded relevance:
@@ -133,6 +135,8 @@ score all pairs -> allocate under capacity -> selected pairs run -> outcomes
 
 Cross-field recommendations that are acted on generate outcomes for pairs that would otherwise never have been observed. Those outcomes are the only genuinely new information in the system, and they enter the training set.
 
+**The loop cannot currently turn.** Recommending a pair produces no outcome unless an organisation actually evaluates that candidate for that role, and a historical dataset is fixed — it contains the outcomes of decisions already taken and cannot be made to yield the outcome of a decision that was not. So the loop above is a specification, not something this project runs: closing it on real data would require organisational adoption and newly collected feedback, and is future work. Everything measured here is measured in simulation, where the generator can be asked for any pair's outcome because it defined them all.
+
 **Three distinct maintenance operations**, routinely conflated:
 
 *Retraining* refits the model on accumulated data. Run on a fixed cadence and additionally on trigger when monitoring fires.
@@ -172,7 +176,19 @@ subject to capacity constraints
 
 where `λ` prices the value of learning against the cost of a less immediately productive placement. This connects the allocation layer to active learning and to bandit problems, and it turns the optimisation layer into the mechanism that repairs the learning layer's central weakness rather than a component bolted onto it.
 
-Kept as a research extension deliberately: it is the part that requires an organisation to act on recommendations it is uncertain about, which is an organisational question rather than a technical one. In simulation it needs no such permission, and it is where the interesting result lies — a system with a small exploration budget should overtake pure exploitation after enough rounds, despite performing worse in the first few.
+**The experiment.** The round machinery above already reveals outcomes for selected pairs only; exploration changes which pairs those are. Two policies run against identical ground truth from identical initial conditions: pure exploitation, and one reserving a small screening budget — 5% is a reasonable starting figure — for pairs that are promising but uncertain, weighted toward cross-field candidates. Both retrain and recalibrate each round. Three quantities are measured, none of which a single split can express:
+
+| Measure | Question |
+|---|---|
+| Cross-field discovery | how many genuinely good out-of-field pairs are found, against the generator's ground truth |
+| Selection bias | does the training set's coverage of the pair space widen or narrow across rounds |
+| Cumulative regret | total fit forgone relative to the omniscient allocation, summed over rounds |
+
+The expected result is a crossover: exploration pays a visible cost in early rounds and overtakes pure exploitation later. If no crossover appears within a plausible number of rounds, that is a genuine finding and gets reported as one — a 5% budget may simply not pay for itself at this scale.
+
+**Three kinds of evidence, not to be conflated.** Simulation can demonstrate that a policy works under known ground truth. Historical data can support *retrospective* analysis — candidates who applied to several roles, recruiter redirections between pipelines, comparable profiles observed in different pipelines — which is suggestive of cross-field fit but is observational, not a controlled comparison, because the pairs were chosen by people rather than by a policy under test. Public recommendation datasets can help validate the general method, though they typically lack complete recruiting-funnel outcomes. Only live deployment could demonstrate real-world effect, and that is out of scope here.
+
+Kept as an optional extension deliberately: it is the part that would require an organisation to act on recommendations it is uncertain about, which is an organisational question rather than a technical one. Simulation needs no such permission, which is both why the result is obtainable and why it stays a claim about simulation.
 
 ## Output
 
@@ -195,14 +211,14 @@ Each recommendation carries its reasons: requirements met, requirements missing,
 7. Round-based loop: periodic retraining, recalibration, drift monitoring, propensity logging
 8. Per-recommendation explanations; error analysis by seniority, function, profile conventionality
 
-**On real data** — requires read-only access
+**On real data** — conditional on read-only access, which is not currently granted
 
 9. Candidate features and graded funnel-depth labels; establish the applications-per-candidate ratio and the count of multi-application candidates
 10. Cross-role backtest: candidates rejected for role A whom the model flags for role B, checked against comparable profiles later hired into B
 
 **Academic extension**
 
-11. Exploration budget — allocation under uncertainty, measured across simulated hiring rounds against a pure-exploitation control
+11. Exploration budget — allocation under uncertainty over simulated hiring rounds against a pure-exploitation control, measuring cross-field discovery, selection bias and cumulative regret
 12. Fairness constraints in allocation: envy-freeness, Nash social welfare
 
 ## Reading
@@ -220,6 +236,6 @@ For the loop specifically: **[Runaway Feedback Loops in Predictive Policing](htt
 
 Built as a standalone system: generic candidate, role and outcome tables in, ranked matches out. No proprietary data, code or model artefacts belong in this repository.
 
-A personal research project, developed independently and evaluated entirely in simulation. Should the approach demonstrate a measurable gain over rounds against its controls, it could then be proposed as something to trial on real data — but the burden of evidence sits here first, in an environment where the ground truth is known and the claims are falsifiable.
+A personal research project, developed independently and evaluated entirely in simulation. It is not an initiative of any company, is not conducted on approved production data, and demonstrates no real-world impact. Should the approach show a measurable gain over rounds against its controls, it could then be *proposed* as something to trial on real data — but the burden of evidence sits here first, in an environment where the ground truth is known and the claims are falsifiable.
 
 Employment-related models are consequential. This one is intended to widen the set of candidates a human considers — never to reject anyone automatically.
